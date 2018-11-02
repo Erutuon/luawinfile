@@ -50,6 +50,119 @@
 #define S_ISBLK(mode)  (0)
 #endif
 
+// for compatibility with Lua 5.1
+#ifndef luaL_checkversion
+#define luaL_checkversion(L) ((void) (L))
+#endif
+
+// from https://github.com/keplerproject/lua-compat-5.3/blob/master/c-api/compat-5.3.h
+#ifndef luaL_newlibtable
+#define luaL_newlibtable(L, l) \
+	(lua_createtable((L), 0, sizeof((l))/sizeof(*(l))-1))
+#endif
+
+#ifndef luaL_newlib
+#define luaL_newlib(L, l) \
+	(luaL_newlibtable((L), (l)), luaL_register((L), NULL, (l)))
+#endif
+
+
+#ifdef LUA_VERSION_NUM
+# if LUA_VERSION_NUM == 501 /* Lua 5.1 */
+#  define lua_geti lua_rawgeti
+#  define lua_seti lua_rawseti
+
+#  define lua_getuservalue(L, i) \
+	(lua_getfenv((L), (i)), lua_type((L), -1))
+#  define lua_setuservalue(L, i) \
+	(luaL_checktype((L), -1, LUA_TTABLE), lua_setfenv((L), (i)))
+
+#  define lua_compat_load(L, reader, dt, chunkname, mode) lua_load(L, reader, dt, chunkname)
+#  define LUA_OK 0
+#  define LUAMOD_API LUALIB_API
+
+#  define lua_callk(L, na, nr, ctx, cont) \
+	((void)(ctx), (void)(cont), lua_call((L), (na), (nr)))
+
+typedef struct luaL_Stream {
+	FILE *f;
+} luaL_Stream;
+
+static int luaL_fileresult (lua_State *L, int stat, const char *fname) {
+	int en = errno;  /* calls to Lua API may change this value */
+	if (stat) {
+		lua_pushboolean(L, 1);
+		return 1;
+	}
+	else {
+		lua_pushnil(L);
+		if (fname)
+			lua_pushfstring(L, "%s: %s", fname, strerror(en));
+		else
+			lua_pushstring(L, strerror(en));
+		lua_pushnumber(L, (lua_Number)en);
+		return 3;
+	}
+}
+
+
+#if !defined(l_inspectstat) && \
+    (defined(unix) || defined(__unix) || defined(__unix__) || \
+     defined(__TOS_AIX__) || defined(_SYSTYPE_BSD) || \
+     (defined(__APPLE__) && defined(__MACH__)))
+/* some form of unix; check feature macros in unistd.h for details */
+#  include <unistd.h>
+/* check posix version; the relevant include files and macros probably
+ * were available before 2001, but I'm not sure */
+#  if defined(_POSIX_VERSION) && _POSIX_VERSION >= 200112L
+#    include <sys/wait.h>
+#    define l_inspectstat(stat,what) \
+  if (WIFEXITED(stat)) { stat = WEXITSTATUS(stat); } \
+  else if (WIFSIGNALED(stat)) { stat = WTERMSIG(stat); what = "signal"; }
+#  endif
+#endif
+
+/* provide default (no-op) version */
+#if !defined(l_inspectstat)
+#  define l_inspectstat(stat,what) ((void)0)
+#endif
+
+static int luaL_execresult (lua_State *L, int stat) {
+	const char *what = "exit";
+	if (stat == -1)
+		return luaL_fileresult(L, 0, NULL);
+	else {
+		l_inspectstat(stat, what);
+		if (*what == 'e' && stat == 0)
+			lua_pushboolean(L, 1);
+		else
+			lua_pushnil(L);
+		lua_pushstring(L, what);
+		lua_pushinteger(L, stat);
+		return 3;
+	}
+}
+
+static void luaL_setmetatable (lua_State *L, const char *tname) {
+	luaL_checkstack(L, 1, "not enough stack slots");
+	luaL_getmetatable(L, tname);
+	lua_setmetatable(L, -2);
+}
+
+# endif
+
+# if LUA_VERSION_NUM >= 502
+#  define lua_compat_load lua_load
+
+#  define lua_callk(L, na, nr, ctx, cont) \
+	lua_callk((L), (na), (nr), (ctx), cont ## _52)
+# endif
+
+# if LUA_VERSION_NUM <= 502 /* Lua 5.1, 5.2 */
+typedef int lua_KContext;
+# endif
+#endif
+
 static int
 utf8_filename(lua_State *L, const wchar_t * winfilename, int wsz, char *utf8buffer, int sz) {
 	sz = WideCharToMultiByte(CP_UTF8, 0, winfilename, wsz, utf8buffer, sz, NULL, NULL);
@@ -614,11 +727,11 @@ wloadfilex (lua_State *L, const wchar_t *filename, const char * debugname, const
 	}
 	if (c	!= EOF)
 		lf.buff[lf.n++]	= c;  /* 'c' is	the	first character	of the stream */
-	status = lua_load(L, getF, &lf, lua_tostring(L, -1), mode);
+	status = lua_compat_load(L, getF, &lf, lua_tostring(L, -1), mode);
 	readstatus = ferror(lf.f);
 	if (filename)	fclose(lf.f);  /* close	file (even in case of errors) */
 	if (readstatus) {
-		lua_settop(L, fnameindex);	/* ignore results from 'lua_load' */
+		lua_settop(L, fnameindex);	/* ignore results from 'lua_compat_load' */
 		return errfile(L, "read", fnameindex);
 	}
 	lua_remove(L,	fnameindex);
@@ -685,6 +798,7 @@ static int ldofile (lua_State *L) {
 	return dofilecont(L, 0, 0);
 }
 
+#define LUA_FILEHANDLE          "FILE*"
 #define tolstream(L)	((LStream *)luaL_checkudata(L, 1, LUA_FILEHANDLE))
 
 typedef luaL_Stream LStream;
@@ -705,7 +819,9 @@ static int io_fclose (lua_State *L) {
 */
 static LStream *newprefile (lua_State *L) {
 	LStream *p = (LStream *)lua_newuserdata(L, sizeof(LStream));
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM > 501
 	p->closef = NULL;  /* mark file handle as 'closed' */
+#endif
 	luaL_setmetatable(L, LUA_FILEHANDLE);
 	return p;
 }
@@ -713,7 +829,9 @@ static LStream *newprefile (lua_State *L) {
 static LStream *newfile (lua_State *L) {
 	LStream *p = newprefile(L);
 	p->f = NULL;
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM > 501
 	p->closef = &io_fclose;
+#endif
 	return p;
 }
 
@@ -760,7 +878,9 @@ lpopen(lua_State *L) {
 	wmode[n] = 0;
 
 	p->f = _wpopen(path, wmode);
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM > 501
 	p->closef = &io_pclose;
+#endif
 	return (p->f == NULL) ? luaL_fileresult(L, 0, filename) : 1;
 }
 
